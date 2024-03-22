@@ -23,8 +23,6 @@ use super::{
     TrieKey,
 };
 
-#[cfg(test)]
-use log::trace;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Membership {
@@ -436,7 +434,7 @@ impl<H: StarkHash> MerkleTree<H> {
         if value == Felt::ZERO {
             return self.delete_leaf(db, key);
         }
-        let path = self.preload_nodes(db, key)?;
+        let path = self.preload_nodes(db, key, false)?;
         // There are three possibilities.
         //
         // 1. The leaf exists, in which case we simply change its value.
@@ -602,19 +600,25 @@ impl<H: StarkHash> MerkleTree<H> {
         // and other remaining child node -- if they're also edges.
         //
         // Then we are done.
+        if db.get(&TrieKey::Flat(build_db_key(&self.identifier, &bitslice_to_bytes(key))))?.is_none() {
+            println!("key {:?} doesn't exist", key);
+            return Ok(());
+        }
+        println!("key to be deleted {:?}", key);
 
         let key_bytes = bitslice_to_bytes(key);
         self.cache_leaf_modified
             .insert(key_bytes.clone(), InsertOrRemove::Remove);
 
-        let path = self.preload_nodes(db, key)?;
+        let path = self.preload_nodes(db, key, true)?;
 
         let mut last_binary_path = Path(key.to_bitvec());
 
         // Go backwards until we hit a branch node.
-        let mut node_iter = path.into_iter().rev().skip_while(|node| {
+        let mut node_iter = path.clone().into_iter().rev().skip_while(|node_id| {
             // SAFETY: Has been populate by preload_nodes just above
-            let node = self.storage_nodes.0.get(node).unwrap();
+            let node = self.storage_nodes.0.get(node_id).unwrap();
+            println!("id {:?} node by the bottom {:?}", node_id, node);
             match node {
                 Node::Unresolved(_) => {}
                 Node::Binary(_) => {}
@@ -636,8 +640,17 @@ impl<H: StarkHash> MerkleTree<H> {
         });
         let branch_node = node_iter.next();
         let parent_branch_node = node_iter.next();
+        if let Some(parent_node_id) = parent_branch_node {
+            let parent_node = self.storage_nodes.0.get(&parent_node_id).ok_or(
+                BonsaiStorageError::Trie("Node not found in memory".to_string()),
+            )?;
+            println!("parent node {:?}", parent_node);
+        }
         match branch_node {
             Some(node_id) => {
+                println!("before first");
+                self.print(&node_id);
+                println!("after first");
                 let new_edge =
                     {
                         let node = self.storage_nodes.0.get_mut(&node_id).ok_or(
@@ -682,6 +695,9 @@ impl<H: StarkHash> MerkleTree<H> {
                 } else {
                     self.storage_nodes.0.insert(node_id, Node::Edge(new_edge));
                 }
+                println!("before end");
+                self.print(&node_id);
+                println!("after end");
             }
             None => {
                 // We reached the root without a hitting binary node. The new tree
@@ -918,6 +934,7 @@ impl<H: StarkHash> MerkleTree<H> {
         &mut self,
         db: &mut KeyValueDB<DB, ID>,
         dst: &BitSlice<u8, Msb0>,
+        print: bool,
     ) -> Result<Vec<NodeId>, BonsaiStorageError<DB::DatabaseError>> {
         let mut nodes = Vec::with_capacity(251);
         let node_id = match self.root_handle {
@@ -947,6 +964,7 @@ impl<H: StarkHash> MerkleTree<H> {
             node_id,
             Path(BitVec::<u8, Msb0>::new()),
             &mut nodes,
+            print
         )?;
         Ok(nodes)
     }
@@ -958,6 +976,7 @@ impl<H: StarkHash> MerkleTree<H> {
         root_id: NodeId,
         mut path: Path,
         nodes: &mut Vec<NodeId>,
+        print: bool,
     ) -> Result<(), BonsaiStorageError<DB::DatabaseError>> {
         let node = self
             .storage_nodes
@@ -967,6 +986,9 @@ impl<H: StarkHash> MerkleTree<H> {
                 "Couldn't fetch node in the temporary storage".to_string(),
             ))?
             .clone();
+        if print {
+            println!("node in subtree id: {:?} node: {:?}", root_id, node);
+        }
         match node {
             // We are in a case where the trie is empty and so there is nothing to preload.
             Node::Unresolved(_hash) => Ok(()),
@@ -998,14 +1020,14 @@ impl<H: StarkHash> MerkleTree<H> {
                             self.storage_nodes
                                 .0
                                 .insert(root_id, Node::Binary(binary_node));
-                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes)
+                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes, print)
                         } else {
                             Ok(())
                         }
                     }
                     NodeHandle::InMemory(next_id) => {
                         nodes.push(next_id);
-                        self.preload_nodes_subtree(db, dst, next_id, path, nodes)
+                        self.preload_nodes_subtree(db, dst, next_id, path, nodes, print)
                     }
                 }
             }
@@ -1028,19 +1050,24 @@ impl<H: StarkHash> MerkleTree<H> {
                             nodes.push(self.latest_node_id);
                             edge_node.child = NodeHandle::InMemory(self.latest_node_id);
                             self.storage_nodes.0.insert(root_id, Node::Edge(edge_node));
-                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes)
+                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes, print)
                         } else {
                             Ok(())
                         }
                     }
                     NodeHandle::InMemory(next_id) => {
                         nodes.push(next_id);
-                        self.preload_nodes_subtree(db, dst, next_id, path, nodes)
+                        self.preload_nodes_subtree(db, dst, next_id, path, nodes, print)
                     }
                 }
             }
             // We are in a case where the edge node doesn't match the path we want to preload so we return nothing.
-            Node::Edge(_) => Ok(()),
+            Node::Edge(_) => {
+                if print {
+                    println!("edge node doesn't match the path we want to preload");
+                }
+                Ok(())
+            },
         }
     }
 
@@ -1187,31 +1214,30 @@ impl<H: StarkHash> MerkleTree<H> {
     fn display(&self) {
         match self.root_handle {
             NodeHandle::Hash(hash) => {
-                trace!("root is hash: {:?}", hash);
+                println!("root is hash: {:?}", hash);
             }
             NodeHandle::InMemory(root_id) => {
-                trace!("root is node: {:?}", root_id);
+                println!("root is node: {:?}", root_id);
                 self.print(&root_id);
             }
         }
     }
 
-    #[cfg(test)]
     #[allow(dead_code)]
     fn print(&self, head: &NodeId) {
         use Node::*;
 
         let current_tmp = self.storage_nodes.0.get(head).unwrap().clone();
-        trace!("bonsai_node {:?} = {:?}", head, current_tmp);
+        println!("bonsai_node {:?} = {:?}", head, current_tmp);
 
         match current_tmp {
             Unresolved(hash) => {
-                trace!("Unresolved: {:?}", hash);
+                println!("Unresolved: {:?}", hash);
             }
             Binary(binary) => {
                 match &binary.get_child(Direction::Left) {
                     NodeHandle::Hash(hash) => {
-                        trace!("left is hash {:?}", hash);
+                        println!("left is hash {:?}", hash);
                     }
                     NodeHandle::InMemory(left_id) => {
                         self.print(left_id);
@@ -1219,7 +1245,7 @@ impl<H: StarkHash> MerkleTree<H> {
                 }
                 match &binary.get_child(Direction::Right) {
                     NodeHandle::Hash(hash) => {
-                        trace!("right is hash {:?}", hash);
+                        println!("right is hash {:?}", hash);
                     }
                     NodeHandle::InMemory(right_id) => {
                         self.print(right_id);
@@ -1228,7 +1254,7 @@ impl<H: StarkHash> MerkleTree<H> {
             }
             Edge(edge) => match &edge.child {
                 NodeHandle::Hash(hash) => {
-                    trace!("child is hash {:?}", hash);
+                    println!("child is hash {:?}", hash);
                 }
                 NodeHandle::InMemory(child_id) => {
                     self.print(child_id);
