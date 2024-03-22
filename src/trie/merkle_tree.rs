@@ -23,7 +23,6 @@ use super::{
     TrieKey,
 };
 
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Membership {
     Member,
@@ -299,6 +298,7 @@ impl<H: StarkHash> MerkleTree<H> {
             db.remove(&node_key, Some(batch))?;
         }
         let root_hash = self.commit_subtree(db, self.root_handle, Path(BitVec::new()), batch)?;
+        println!("root_hash after commit {root_hash:#064x}");
         for (key, value) in mem::take(&mut self.cache_leaf_modified) {
             match value {
                 InsertOrRemove::Insert(value) => {
@@ -431,10 +431,30 @@ impl<H: StarkHash> MerkleTree<H> {
         key: &BitSlice<u8, Msb0>,
         value: Felt,
     ) -> Result<(), BonsaiStorageError<DB::DatabaseError>> {
+        let debug_key: BitVec<u8, Msb0> =
+            Felt::from_hex("0x1557182e4359a1f0c6301278e8f5b35a776ab58d39892581e357578fb287836")
+                .unwrap()
+                .to_bytes_be()
+                .view_bits()[5..]
+                .to_bitvec();
         if value == Felt::ZERO {
             return self.delete_leaf(db, key);
         }
+        // No value change if the leaf already exists with the same value.
+        if let Some(leaf_value) = db.get(&TrieKey::Flat(build_db_key(
+            &self.identifier,
+            &bitslice_to_bytes(key),
+        )))? {
+            if leaf_value == value.encode() {
+                return Ok(());
+            }
+        }
         let path = self.preload_nodes(db, key, false)?;
+        if debug_key == key {
+            println!("key to be inserted {:?}", key);
+            println!("path {:?}", path);
+            self.print(path.first().unwrap());
+        }
         // There are three possibilities.
         //
         // 1. The leaf exists, in which case we simply change its value.
@@ -442,7 +462,7 @@ impl<H: StarkHash> MerkleTree<H> {
         // 2. The tree is empty, we insert the new leaf and the root becomes an edge node connecting to it.
         //
         // 3. The leaf does not exist, and the tree is not empty. The final node in the traversal will be an
-        //    edge node who's path diverges from our new leaf node's.
+        //    edge node who's path diverges from our new leaf node's or a binary node.
         //
         //    This edge must be split into a new subtree containing both the existing edge's child and the
         //    new leaf. This requires an edge followed by a binary node and then further edges to both the
@@ -456,95 +476,113 @@ impl<H: StarkHash> MerkleTree<H> {
             Some(node_id) => {
                 let mut nodes_to_add = Vec::new();
                 self.storage_nodes.0.entry(*node_id).and_modify(|node| {
-                    if let Edge(edge) = node {
-                        let common = edge.common_path(key);
-                        // Height of the binary node
-                        let branch_height = edge.height as usize + common.len();
-                        if branch_height == key.len() {
-                            edge.child = NodeHandle::Hash(value);
-                            // The leaf already exists, we simply change its value.
+                    match node {
+                        Edge(edge) => {
+                            let common = edge.common_path(key);
+                            // Height of the binary node
+                            let branch_height = edge.height as usize + common.len();
+                            if branch_height == key.len() {
+                                edge.child = NodeHandle::Hash(value);
+                                // The leaf already exists, we simply change its value.
+                                let key_bytes = bitslice_to_bytes(key);
+                                self.cache_leaf_modified
+                                    .insert(key_bytes, InsertOrRemove::Insert(value));
+                                return;
+                            }
+                            // Height of the binary node's children
+                            let child_height = branch_height + 1;
+
+                            // Path from binary node to new leaf
+                            let new_path = key[child_height..].to_bitvec();
+                            // Path from binary node to existing child
+                            let old_path = edge.path.0[common.len() + 1..].to_bitvec();
+
+                            // The new leaf branch of the binary node.
+                            // (this may be edge -> leaf, or just leaf depending).
                             let key_bytes = bitslice_to_bytes(key);
                             self.cache_leaf_modified
                                 .insert(key_bytes, InsertOrRemove::Insert(value));
-                            return;
+
+                            let new = if new_path.is_empty() {
+                                NodeHandle::Hash(value)
+                            } else {
+                                let new_edge = Node::Edge(EdgeNode {
+                                    hash: None,
+                                    height: child_height as u64,
+                                    path: Path(new_path),
+                                    child: NodeHandle::Hash(value),
+                                });
+                                let edge_id = self.latest_node_id.next_id();
+                                nodes_to_add.push((edge_id, new_edge));
+                                NodeHandle::InMemory(edge_id)
+                            };
+
+                            // The existing child branch of the binary node.
+                            let old = if old_path.is_empty() {
+                                edge.child
+                            } else {
+                                let old_edge = Node::Edge(EdgeNode {
+                                    hash: None,
+                                    height: child_height as u64,
+                                    path: Path(old_path),
+                                    child: edge.child,
+                                });
+                                let edge_id = self.latest_node_id.next_id();
+                                nodes_to_add.push((edge_id, old_edge));
+                                NodeHandle::InMemory(edge_id)
+                            };
+
+                            let new_direction = Direction::from(key[branch_height]);
+                            let (left, right) = match new_direction {
+                                Direction::Left => (new, old),
+                                Direction::Right => (old, new),
+                            };
+
+                            let branch = Node::Binary(BinaryNode {
+                                hash: None,
+                                height: branch_height as u64,
+                                left,
+                                right,
+                            });
+
+                            // We may require an edge leading to the binary node.
+                            let new_node = if common.is_empty() {
+                                branch
+                            } else {
+                                let branch_id = self.latest_node_id.next_id();
+                                nodes_to_add.push((branch_id, branch));
+
+                                Node::Edge(EdgeNode {
+                                    hash: None,
+                                    height: edge.height,
+                                    path: Path(common.to_bitvec()),
+                                    child: NodeHandle::InMemory(branch_id),
+                                })
+                            };
+                            let path = key[..edge.height as usize].to_bitvec();
+                            let key_bytes =
+                                [&[path.len() as u8], path.into_vec().as_slice()].concat();
+                            self.death_row.push(TrieKey::Trie(key_bytes));
+                            *node = new_node;
                         }
-                        // Height of the binary node's children
-                        let child_height = branch_height + 1;
-
-                        // Path from binary node to new leaf
-                        let new_path = key[child_height..].to_bitvec();
-                        // Path from binary node to existing child
-                        let old_path = edge.path.0[common.len() + 1..].to_bitvec();
-
-                        // The new leaf branch of the binary node.
-                        // (this may be edge -> leaf, or just leaf depending).
-                        let key_bytes = bitslice_to_bytes(key);
-                        self.cache_leaf_modified
-                            .insert(key_bytes, InsertOrRemove::Insert(value));
-
-                        let new = if new_path.is_empty() {
-                            NodeHandle::Hash(value)
-                        } else {
-                            let new_edge = Node::Edge(EdgeNode {
-                                hash: None,
-                                height: child_height as u64,
-                                path: Path(new_path),
-                                child: NodeHandle::Hash(value),
-                            });
-                            let edge_id = self.latest_node_id.next_id();
-                            nodes_to_add.push((edge_id, new_edge));
-                            NodeHandle::InMemory(edge_id)
-                        };
-
-                        // The existing child branch of the binary node.
-                        let old = if old_path.is_empty() {
-                            edge.child
-                        } else {
-                            let old_edge = Node::Edge(EdgeNode {
-                                hash: None,
-                                height: child_height as u64,
-                                path: Path(old_path),
-                                child: edge.child,
-                            });
-                            let edge_id = self.latest_node_id.next_id();
-                            nodes_to_add.push((edge_id, old_edge));
-                            NodeHandle::InMemory(edge_id)
-                        };
-
-                        let new_direction = Direction::from(key[branch_height]);
-                        let (left, right) = match new_direction {
-                            Direction::Left => (new, old),
-                            Direction::Right => (old, new),
-                        };
-
-                        let branch = Node::Binary(BinaryNode {
-                            hash: None,
-                            height: branch_height as u64,
-                            left,
-                            right,
-                        });
-
-                        // We may require an edge leading to the binary node.
-                        let new_node = if common.is_empty() {
-                            branch
-                        } else {
-                            let branch_id = self.latest_node_id.next_id();
-                            nodes_to_add.push((branch_id, branch));
-
-                            Node::Edge(EdgeNode {
-                                hash: None,
-                                height: edge.height,
-                                path: Path(common.to_bitvec()),
-                                child: NodeHandle::InMemory(branch_id),
-                            })
-                        };
-                        let path = key[..edge.height as usize].to_bitvec();
-                        let key_bytes = [&[path.len() as u8], path.into_vec().as_slice()].concat();
-                        self.death_row.push(TrieKey::Trie(key_bytes));
-                        *node = new_node;
+                        Binary(binary) => {
+                            if (binary.height + 1) as usize == key.len() {
+                                let direction = Direction::from(key[binary.height as usize]);
+                                match direction {
+                                    Direction::Left => binary.left = NodeHandle::Hash(value),
+                                    Direction::Right => binary.right = NodeHandle::Hash(value),
+                                };
+                                
+                                return;
+                            }
+                        }
+                        _ => {}
                     };
                 });
                 for (id, node) in nodes_to_add {
+                    if debug_key == key {
+                        println!("node to be added {:?}", node);
+                    }
                     self.storage_nodes.0.insert(id, node);
                 }
                 Ok(())
@@ -600,8 +638,13 @@ impl<H: StarkHash> MerkleTree<H> {
         // and other remaining child node -- if they're also edges.
         //
         // Then we are done.
-        if db.get(&TrieKey::Flat(build_db_key(&self.identifier, &bitslice_to_bytes(key))))?.is_none() {
-            println!("key {:?} doesn't exist", key);
+        if db
+            .get(&TrieKey::Flat(build_db_key(
+                &self.identifier,
+                &bitslice_to_bytes(key),
+            )))?
+            .is_none()
+        {
             return Ok(());
         }
         println!("key to be deleted {:?}", key);
@@ -641,9 +684,13 @@ impl<H: StarkHash> MerkleTree<H> {
         let branch_node = node_iter.next();
         let parent_branch_node = node_iter.next();
         if let Some(parent_node_id) = parent_branch_node {
-            let parent_node = self.storage_nodes.0.get(&parent_node_id).ok_or(
-                BonsaiStorageError::Trie("Node not found in memory".to_string()),
-            )?;
+            let parent_node =
+                self.storage_nodes
+                    .0
+                    .get(&parent_node_id)
+                    .ok_or(BonsaiStorageError::Trie(
+                        "Node not found in memory".to_string(),
+                    ))?;
             println!("parent node {:?}", parent_node);
         }
         match branch_node {
@@ -964,7 +1011,7 @@ impl<H: StarkHash> MerkleTree<H> {
             node_id,
             Path(BitVec::<u8, Msb0>::new()),
             &mut nodes,
-            print
+            print,
         )?;
         Ok(nodes)
     }
@@ -1020,7 +1067,14 @@ impl<H: StarkHash> MerkleTree<H> {
                             self.storage_nodes
                                 .0
                                 .insert(root_id, Node::Binary(binary_node));
-                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes, print)
+                            self.preload_nodes_subtree(
+                                db,
+                                dst,
+                                self.latest_node_id,
+                                path,
+                                nodes,
+                                print,
+                            )
                         } else {
                             Ok(())
                         }
@@ -1050,7 +1104,14 @@ impl<H: StarkHash> MerkleTree<H> {
                             nodes.push(self.latest_node_id);
                             edge_node.child = NodeHandle::InMemory(self.latest_node_id);
                             self.storage_nodes.0.insert(root_id, Node::Edge(edge_node));
-                            self.preload_nodes_subtree(db, dst, self.latest_node_id, path, nodes, print)
+                            self.preload_nodes_subtree(
+                                db,
+                                dst,
+                                self.latest_node_id,
+                                path,
+                                nodes,
+                                print,
+                            )
                         } else {
                             Ok(())
                         }
@@ -1067,7 +1128,7 @@ impl<H: StarkHash> MerkleTree<H> {
                     println!("edge node doesn't match the path we want to preload");
                 }
                 Ok(())
-            },
+            }
         }
     }
 
